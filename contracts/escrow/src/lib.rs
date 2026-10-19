@@ -18,6 +18,14 @@ pub const MAX_MILESTONES: u32 = 20;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280; // ~1 day
 const PERSISTENT_TTL_EXTEND: u32 = 518_400; // ~30 days
+/// How long the contract must stay continuously paused before either party may
+/// unwind an escrow unilaterally. Thirty days.
+///
+/// The pause is a circuit breaker, so it is expected to be short. A pause that
+/// outlives this window means the admin key is lost, or the admin is refusing to
+/// let funds move, and at that point the parties' own exit has to outrank the
+/// admin's control.
+pub const EMERGENCY_EXIT_DELAY_SECS: u64 = 30 * 86_400;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -39,6 +47,9 @@ pub enum EscrowError {
     InvalidSplit = 14,
     InvalidRating = 15,
     ReputationAlreadyIssued = 16,
+    /// The contract has not been paused long enough for the emergency exit to
+    /// open, or the pause that started the clock is no longer in effect.
+    EmergencyExitNotAvailable = 17,
 }
 
 #[contracttype]
@@ -86,6 +97,9 @@ pub struct Reputation {
 enum DataKey {
     Admin,
     Paused,
+    /// Ledger timestamp of the start of the current continuous pause. Absent
+    /// while unpaused, so its presence is what the emergency exit keys off.
+    PausedAt,
     NextId,
     Contract(u64),
     Reputation(Address),
@@ -170,9 +184,26 @@ impl Escrow {
         admin(&env)
     }
 
+    /// Admin circuit breaker for every mutating entry point.
+    ///
+    /// Records the start of the pause so `emergency_withdraw` can measure how
+    /// long it has lasted. The clock starts only on a genuine unpaused -> paused
+    /// transition: pausing while already paused leaves the original timestamp
+    /// alone, so a repeated `set_paused(true)` cannot be used to push the
+    /// deadline out. Unpausing clears it.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), EscrowError> {
         require_admin(&env)?;
+        let was_paused = Self::is_paused(env.clone());
         env.storage().instance().set(&DataKey::Paused, &paused);
+        if paused {
+            if !was_paused {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PausedAt, &env.ledger().timestamp());
+            }
+        } else {
+            env.storage().instance().remove(&DataKey::PausedAt);
+        }
         bump_instance(&env);
         env.events().publish((symbol_short!("paused"),), paused);
         Ok(())
@@ -183,6 +214,12 @@ impl Escrow {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Ledger timestamp at which the current continuous pause began, or `None`
+    /// while the contract is unpaused.
+    pub fn paused_at(env: Env) -> Option<u64> {
+        env.storage().instance().get(&DataKey::PausedAt)
     }
 
     /// Creates a new escrow agreement. Returns the escrow id.
@@ -370,6 +407,84 @@ impl Escrow {
         c.status = ContractStatus::Cancelled;
         save(&env, &c);
         env.events().publish((symbol_short!("cancel"), id), refund);
+        Ok(())
+    }
+
+    /// Unwinds an escrow when the contract has been paused for longer than
+    /// `EMERGENCY_EXIT_DELAY_SECS`.
+    ///
+    /// While paused, `require_not_paused` blocks every path that moves money out
+    /// of an escrow, and only the admin can unpause. A lost or uncooperative
+    /// admin key would therefore freeze every escrow permanently. This is the
+    /// parties' own way out: after a long enough continuous pause, either party
+    /// may unwind their escrow at its last agreed state.
+    ///
+    /// Deliberately **not** gated by `require_not_paused` — it is the exit from
+    /// the pause, so gating it on the pause would defeat it.
+    ///
+    /// Payout: unreleased funds go back to the client, because nothing was
+    /// released and the client is the party whose money is at risk. A disputed
+    /// escrow is the one case where fault is genuinely unclear, so it splits
+    /// 50/50 with the odd unit going to the client.
+    pub fn emergency_withdraw(env: Env, caller: Address, id: u64) -> Result<(), EscrowError> {
+        let mut c = load(&env, id)?;
+        caller.require_auth();
+        if caller != c.client && caller != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        // Only live escrows. A `Cancelled` escrow has already been unwound, so a
+        // second call lands here and cannot pay twice.
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Disputed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if !Self::is_paused(env.clone()) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        // The deadline is measured from the start of the current continuous
+        // pause, so unpausing and re-pausing restarts it.
+        let paused_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedAt)
+            .ok_or(EscrowError::EmergencyExitNotAvailable)?;
+        let deadline = paused_at
+            .checked_add(EMERGENCY_EXIT_DELAY_SECS)
+            .ok_or(EscrowError::EmergencyExitNotAvailable)?;
+        if env.ledger().timestamp() < deadline {
+            return Err(EscrowError::EmergencyExitNotAvailable);
+        }
+
+        let held = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::InsufficientFunds)?;
+        let (to_client, to_freelancer) = if c.status == ContractStatus::Disputed {
+            let half = held / 2;
+            // `held - half` rounds the odd unit up, to the client.
+            (held - half, half)
+        } else {
+            (held, 0)
+        };
+
+        let this = env.current_contract_address();
+        transfer(&env, &c.token, &this, &c.client, to_client);
+        transfer(&env, &c.token, &this, &c.freelancer, to_freelancer);
+
+        // Mirrors `resolve_dispute`: the freelancer's share counts as released,
+        // and `funded_amount` drops to match, so the custody invariant
+        // (balance == funded - released) holds with a zero balance.
+        c.released_amount = c
+            .released_amount
+            .checked_add(to_freelancer)
+            .ok_or(EscrowError::InvalidAmount)?;
+        c.funded_amount = c.released_amount;
+        c.status = ContractStatus::Cancelled;
+        save(&env, &c);
+        env.events()
+            .publish((symbol_short!("emerg"), id), (to_client, to_freelancer));
         Ok(())
     }
 
