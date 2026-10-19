@@ -39,6 +39,9 @@ pub enum EscrowError {
     InvalidSplit = 14,
     InvalidRating = 15,
     ReputationAlreadyIssued = 16,
+    /// The milestone is under a milestone-scoped dispute, so it cannot be
+    /// released, and the escrow cannot be cancelled while it is open.
+    MilestoneDisputed = 17,
 }
 
 #[contracttype]
@@ -89,6 +92,9 @@ enum DataKey {
     NextId,
     Contract(u64),
     Reputation(Address),
+    /// An open milestone-scoped dispute. Presence is the state; the value is the
+    /// party who opened it, kept for indexers reading the key back.
+    MilestoneDispute(u64, u32),
 }
 
 #[contract]
@@ -144,6 +150,62 @@ fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amoun
     if amount > 0 {
         token::Client::new(env, token_addr).transfer(from, to, &amount);
     }
+}
+
+/// The party who opened a milestone-scoped dispute on `index`, if one is open.
+fn milestone_dispute(env: &Env, id: u64, index: u32) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MilestoneDispute(id, index))
+}
+
+/// Whether any milestone on this escrow is under a milestone-scoped dispute.
+///
+/// Bounded by `MAX_MILESTONES`, and only called from paths that are already
+/// doing per-milestone work, so the loop is not a concern.
+fn any_milestone_disputed(env: &Env, c: &EscrowContract) -> bool {
+    (0..c.milestones.len()).any(|i| milestone_dispute(env, c.id, i).is_some())
+}
+
+/// `floor(held * bps / BPS_DENOMINATOR)`, computed so it cannot overflow.
+///
+/// The direct form multiplies first, so it is only valid while
+/// `held <= i128::MAX / BPS_DENOMINATOR`. Past that it traps, and because the
+/// release profile sets `overflow-checks = true` the trap is a panic the caller
+/// cannot handle. Splitting `held` by the denominator removes the wide product
+/// entirely.
+///
+/// # Correctness
+///
+/// Write `held = q * D + r` with `D = BPS_DENOMINATOR`, `q = held / D` and
+/// `r = held % D`, so `0 <= r < D` by the division algorithm. Then
+///
+/// ```text
+/// held * bps = (q * D + r) * bps = q * D * bps + r * bps
+/// ```
+///
+/// Dividing by `D` and taking the floor:
+///
+/// ```text
+/// floor(held * bps / D) = q * bps + floor(r * bps / D)
+/// ```
+///
+/// because `q * D * bps / D = q * bps` is an integer and `floor` distributes
+/// over an integer summand. The right-hand side is exactly what this function
+/// evaluates, so it equals `floor(held * bps / D)` for every `held` and `bps`.
+///
+/// # Bounds
+///
+/// Each step is proved to stay in range for all `held >= 0` and
+/// `0 <= bps <= D`:
+///
+/// - `q = held / D <= held`, so `q * bps <= q * D <= held <= i128::MAX`.
+/// - `r < D = 10_000` and `bps <= D = 10_000`, so `r * bps < 10^8`.
+/// - `q * bps + (r * bps) / D = floor(held * bps / D) <= floor(held * D / D) = held`,
+///   since `bps <= D`. So the result cannot exceed `held` either.
+fn split_by_bps(held: i128, bps: u32) -> i128 {
+    let bps = bps as i128;
+    (held / BPS_DENOMINATOR) * bps + ((held % BPS_DENOMINATOR) * bps) / BPS_DENOMINATOR
 }
 
 #[contractimpl]
@@ -288,6 +350,12 @@ impl Escrow {
         if c.funded_amount - c.released_amount < m.amount {
             return Err(EscrowError::InsufficientFunds);
         }
+        // A milestone under its own dispute is the one thing this call cannot
+        // do. Other milestones on the same escrow are unaffected, which is the
+        // point of scoping a dispute to a milestone.
+        if milestone_dispute(&env, id, index).is_some() {
+            return Err(EscrowError::MilestoneDisputed);
+        }
         transfer(
             &env,
             &c.token,
@@ -324,6 +392,140 @@ impl Escrow {
         Ok(())
     }
 
+    /// Either party may dispute a single milestone, locking only that
+    /// milestone's amount.
+    ///
+    /// A whole-escrow dispute freezes every milestone and lets the resolver
+    /// reallocate funds for work nobody contested. This is the narrow version:
+    /// only the disputed milestone is blocked, and only its `amount` is ever
+    /// split on resolution.
+    ///
+    /// The milestone must be unreleased and fully funded, so a dispute cannot be
+    /// opened over money the escrow does not hold.
+    pub fn open_milestone_dispute(
+        env: Env,
+        id: u64,
+        caller: Address,
+        index: u32,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        caller.require_auth();
+        if caller != c.client && caller != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let m = c
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        if m.released {
+            return Err(EscrowError::MilestoneAlreadyReleased);
+        }
+        // One open dispute per milestone. A second would let the opener restart
+        // the process, and there is nothing for a second one to add.
+        if milestone_dispute(&env, id, index).is_some() {
+            return Err(EscrowError::MilestoneDisputed);
+        }
+        // The amount has to be covered by funds that are not already released,
+        // so the dispute is always backed by money the contract actually holds.
+        if c.funded_amount - c.released_amount < m.amount {
+            return Err(EscrowError::InsufficientFunds);
+        }
+        let key = DataKey::MilestoneDispute(id, index);
+        env.storage().persistent().set(&key, &caller);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("m_disp"), id), (index, caller));
+        Ok(())
+    }
+
+    /// Admin settles a milestone-scoped dispute, splitting only that
+    /// milestone's `amount`.
+    ///
+    /// Marks the milestone released and pays both sides in one step, so the
+    /// disputed milestone cannot be paid twice: `released` is set before the
+    /// call returns, and every payout path checks it.
+    ///
+    /// Accounting mirrors `resolve_dispute`: the freelancer's share counts as
+    /// released, the client's share leaves `funded_amount`, and the two together
+    /// equal `m.amount`. So the custody invariant
+    /// (`balance == funded - released`) holds across the payout.
+    pub fn resolve_milestone_dispute(
+        env: Env,
+        id: u64,
+        index: u32,
+        freelancer_bps: u32,
+    ) -> Result<(), EscrowError> {
+        require_admin(&env)?;
+        let mut c = load(&env, id)?;
+        if milestone_dispute(&env, id, index).is_none() {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if freelancer_bps as i128 > BPS_DENOMINATOR {
+            return Err(EscrowError::InvalidSplit);
+        }
+        let mut m = c
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+
+        // Re-check that the held balance still covers this milestone.
+        //
+        // `open_milestone_dispute` checks this when the dispute opens, but the
+        // balance can fall afterwards: two milestones can each be individually
+        // covered at open time yet together exceed what is held, and resolving
+        // the first reduces the balance before the second is resolved. Without
+        // this the payout would attempt a transfer the token contract rejects,
+        // which fails safely but reports a host error instead of a typed one.
+        let held = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::InsufficientFunds)?;
+        if held < m.amount {
+            return Err(EscrowError::InsufficientFunds);
+        }
+
+        // Only `m.amount` is ever in play, never the whole held balance.
+        let to_freelancer = split_by_bps(m.amount, freelancer_bps);
+        let to_client = m
+            .amount
+            .checked_sub(to_freelancer)
+            .ok_or(EscrowError::InvalidSplit)?;
+
+        let this = env.current_contract_address();
+        transfer(&env, &c.token, &this, &c.freelancer, to_freelancer);
+        transfer(&env, &c.token, &this, &c.client, to_client);
+
+        c.released_amount = c
+            .released_amount
+            .checked_add(to_freelancer)
+            .ok_or(EscrowError::InvalidAmount)?;
+        c.funded_amount = c
+            .funded_amount
+            .checked_sub(to_client)
+            .ok_or(EscrowError::InsufficientFunds)?;
+
+        m.released = true;
+        c.milestones.set(index, m.clone());
+        if c.milestones.iter().all(|x| x.released) {
+            c.status = ContractStatus::Completed;
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MilestoneDispute(id, index));
+        save(&env, &c);
+        env.events().publish(
+            (symbol_short!("m_resolv"), id),
+            (index, to_freelancer, to_client),
+        );
+        Ok(())
+    }
+
     /// Admin resolves a dispute, paying `freelancer_bps` (0..=10000) of the escrowed
     /// balance to the freelancer and refunding the rest to the client.
     pub fn resolve_dispute(env: Env, id: u64, freelancer_bps: u32) -> Result<(), EscrowError> {
@@ -357,6 +559,12 @@ impl Escrow {
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
+        }
+        // Cancelling while a milestone is disputed would refund the contested
+        // amount to the client and settle the dispute by default, which is
+        // exactly what the dispute exists to prevent.
+        if any_milestone_disputed(&env, &c) {
+            return Err(EscrowError::MilestoneDisputed);
         }
         let refund = c.funded_amount - c.released_amount;
         transfer(
