@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["contracts/escrow"]
+# `escrow-fixture` is not deployed. It exists so the escrow's upgrade test has a
+# second real wasm to swap in, which is the only way to prove `execute_upgrade`
+# actually replaces the running code.
+members = ["contracts/escrow", "contracts/escrow-fixture"]
 
 [workspace.package]
 version = "0.1.0"

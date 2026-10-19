@@ -1,0 +1,19 @@
+[package]
+name = "escrow-fixture"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Second contract used only by the escrow upgrade integration test"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+# This crate exists to be compiled to wasm, not to be tested. Building a test
+# harness for it is wasted work, and on Windows rustc aborts with
+# STATUS_STACK_BUFFER_OVERRUN while linking the `--test` target, which fails
+# `cargo test` at the workspace root for no good reason.
+test = false
+
+[dependencies]
+soroban-sdk = "22.0"
