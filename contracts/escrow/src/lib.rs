@@ -39,6 +39,9 @@ pub enum EscrowError {
     InvalidSplit = 14,
     InvalidRating = 15,
     ReputationAlreadyIssued = 16,
+    /// The escrow names an arbiter who has not called `accept_arbiter` yet, so
+    /// funding it would commit money to a judge who never agreed to the role.
+    ArbiterNotAccepted = 17,
 }
 
 #[contracttype]
@@ -81,6 +84,18 @@ pub struct Reputation {
     pub total_rating: u32,
 }
 
+/// The optional per-escrow arbiter, and whether they have agreed to the role.
+///
+/// Kept under its own storage key rather than on `EscrowContract` so an escrow
+/// with no arbiter costs nothing, and so `get_contract` keeps returning the
+/// same shape it always has.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbiterInfo {
+    pub address: Address,
+    pub accepted: bool,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -89,6 +104,7 @@ enum DataKey {
     NextId,
     Contract(u64),
     Reputation(Address),
+    Arbiter(u64),
 }
 
 #[contract]
@@ -146,6 +162,21 @@ fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amoun
     }
 }
 
+/// The arbiter named at creation, if any. Absent means "no arbiter": the admin
+/// decides disputes, exactly as before this feature existed.
+fn arbiter_of(env: &Env, id: u64) -> Option<ArbiterInfo> {
+    env.storage().persistent().get(&DataKey::Arbiter(id))
+}
+
+/// Persist the arbiter and extend its TTL, matching the other persistent keys.
+fn save_arbiter(env: &Env, id: u64, info: &ArbiterInfo) {
+    let key = DataKey::Arbiter(id);
+    env.storage().persistent().set(&key, info);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+}
+
 #[contractimpl]
 impl Escrow {
     /// One-time setup. Sets the admin that controls pausing and dispute resolution.
@@ -186,18 +217,32 @@ impl Escrow {
     }
 
     /// Creates a new escrow agreement. Returns the escrow id.
+    ///
+    /// `arbiter` is an optional neutral party who will decide any dispute on
+    /// this escrow instead of the global admin. When one is named it must be
+    /// distinct from both parties and from the contract itself, and it has to
+    /// call `accept_arbiter` before the escrow can be funded — a judge who never
+    /// agreed to the role must not be holding anyone's money.
     pub fn create_contract(
         env: Env,
         client: Address,
         freelancer: Address,
         token: Address,
         milestone_amounts: Vec<i128>,
+        arbiter: Option<Address>,
     ) -> Result<u64, EscrowError> {
         admin(&env)?;
         require_not_paused(&env)?;
         client.require_auth();
         if client == freelancer {
             return Err(EscrowError::InvalidParties);
+        }
+        if let Some(a) = arbiter.as_ref() {
+            // A party cannot arbitrate its own escrow, and the contract address
+            // is not a signer, so naming it would brick the escrow.
+            if *a == client || *a == freelancer || *a == env.current_contract_address() {
+                return Err(EscrowError::InvalidParties);
+            }
         }
         let n = milestone_amounts.len();
         if n == 0 || n > MAX_MILESTONES {
@@ -231,6 +276,16 @@ impl Escrow {
             reputation_issued: false,
         };
         save(&env, &c);
+        if let Some(a) = arbiter {
+            save_arbiter(
+                &env,
+                id,
+                &ArbiterInfo {
+                    address: a,
+                    accepted: false,
+                },
+            );
+        }
         env.events()
             .publish((symbol_short!("created"), id), (client, freelancer, total));
         Ok(id)
@@ -243,6 +298,12 @@ impl Escrow {
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
+        }
+        // A named arbiter has to have agreed before any money is committed.
+        if let Some(info) = arbiter_of(&env, id) {
+            if !info.accepted {
+                return Err(EscrowError::ArbiterNotAccepted);
+            }
         }
         if amount <= 0 {
             return Err(EscrowError::InvalidAmount);
@@ -307,7 +368,40 @@ impl Escrow {
         Ok(())
     }
 
-    /// Either party may raise a dispute, freezing releases until the admin resolves it.
+    /// The arbiter named on this escrow, if any, and whether they have accepted.
+    pub fn get_arbiter(env: Env, id: u64) -> Option<ArbiterInfo> {
+        arbiter_of(&env, id)
+    }
+
+    /// The named arbiter agrees to judge this escrow's dispute.
+    ///
+    /// Only while the escrow is still `Created`: once it is funded the arbiter
+    /// is fixed, so a party cannot swap the judge out after the money is in.
+    /// The address itself is set at creation and has no setter, so this can only
+    /// ever flip `accepted` from false to true.
+    ///
+    /// Pause-gated with the other mutating entry points, since it changes stored
+    /// state that `deposit_funds` depends on.
+    pub fn accept_arbiter(env: Env, id: u64) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        // No arbiter means there is nobody this call could authorise, so no
+        // caller can be the right one.
+        let mut info = arbiter_of(&env, id).ok_or(EscrowError::Unauthorized)?;
+        info.address.require_auth();
+        if c.status != ContractStatus::Created {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if !info.accepted {
+            info.accepted = true;
+            save_arbiter(&env, id, &info);
+        }
+        env.events()
+            .publish((symbol_short!("arb_acc"), id), info.address);
+        Ok(())
+    }
+
+    /// Either party may raise a dispute, freezing releases until it is resolved.
     pub fn open_dispute(env: Env, id: u64, caller: Address) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let mut c = load(&env, id)?;
@@ -324,11 +418,29 @@ impl Escrow {
         Ok(())
     }
 
-    /// Admin resolves a dispute, paying `freelancer_bps` (0..=10000) of the escrowed
+    /// Resolves a dispute, paying `freelancer_bps` (0..=10000) of the escrowed
     /// balance to the freelancer and refunding the rest to the client.
-    pub fn resolve_dispute(env: Env, id: u64, freelancer_bps: u32) -> Result<(), EscrowError> {
-        require_admin(&env)?;
+    ///
+    /// The caller must be the escrow's accepted arbiter when one was named, and
+    /// the global admin otherwise. Taking the caller as an argument, rather than
+    /// reading the signer out of `require_admin`, is what lets one escrow be
+    /// judged by a party the protocol admin did not choose.
+    pub fn resolve_dispute(
+        env: Env,
+        caller: Address,
+        id: u64,
+        freelancer_bps: u32,
+    ) -> Result<(), EscrowError> {
         let mut c = load(&env, id)?;
+        caller.require_auth();
+        let expected = match arbiter_of(&env, id) {
+            Some(info) if info.accepted => info.address,
+            // No arbiter, or one that never accepted: the admin decides.
+            _ => admin(&env)?,
+        };
+        if caller != expected {
+            return Err(EscrowError::Unauthorized);
+        }
         if c.status != ContractStatus::Disputed {
             return Err(EscrowError::InvalidStatus);
         }
