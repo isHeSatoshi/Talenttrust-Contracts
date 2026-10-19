@@ -32,10 +32,41 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance (basis points to freelancer) |
 | `cancel_contract(id)` | client | Refund unreleased funds and close |
 | `issue_reputation(id, rating)` | client | Rate a completed job (1-5), once |
+| `migrate_escrows(ids) -> u32` | anyone | Re-encode legacy escrow entries into the current storage envelope |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
 | `get_contract(id)`, `contract_count()`, `get_reputation(addr)`, `get_admin()`, `version()` | - | Reads |
 
 Status flow: `Created -> Funded -> Completed`, with `Disputed -> Resolved` and `Cancelled` side exits.
+
+### Versioned storage
+
+Each escrow is stored as a tagged envelope rather than a bare struct:
+
+```rust
+enum StoredEscrow { V1(EscrowContract) }   // DataKey::ContractV(id)
+```
+
+Soroban decodes `contracttype` structs **by field name**, so adding a field to
+`EscrowContract` in a later release would make every entry written by the previous
+version fail to decode — stranding its funds. The envelope keeps the layout
+self-describing: a future release adds a variant and teaches `upgrade_to_latest`
+how to read it. That function is the single conversion point every read goes
+through.
+
+- `load` reads `ContractV(id)` first, then falls back to the legacy
+  `Contract(id)` key and wraps the value as `V1`.
+- Decoding **does not** migrate. `get_contract` is a read and writes nothing.
+- `save` writes the newest variant and removes the legacy key, so the first
+  mutation of an old escrow migrates it. TTL is extended on the new key only.
+- `migrate_escrows(ids)` migrates eagerly and permissionlessly, up to
+  `MIGRATION_BATCH_MAX = 50` ids per call (more returns `InvalidAmount`). It
+  returns how many entries were migrated; already-migrated and unknown ids are
+  skipped, so it is safe to pass a batch straight from `1..=contract_count()`.
+  It only re-encodes values that are already stored, so it cannot alter an
+  escrow's contents, and it is not pause-gated for that reason.
+
+`DataKey::Contract` is kept in the enum as legacy-only so old entries stay
+addressable. No new errors or events.
 
 ## Build and test
 

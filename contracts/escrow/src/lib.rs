@@ -16,6 +16,9 @@ use soroban_sdk::{
 
 pub const MAX_MILESTONES: u32 = 20;
 pub const BPS_DENOMINATOR: i128 = 10_000;
+/// Largest batch `migrate_escrows` accepts, bounding the ledger entries a single
+/// permissionless call can touch.
+pub const MIGRATION_BATCH_MAX: u32 = 50;
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280; // ~1 day
 const PERSISTENT_TTL_EXTEND: u32 = 518_400; // ~30 days
 
@@ -81,13 +84,30 @@ pub struct Reputation {
     pub total_rating: u32,
 }
 
+/// A versioned storage envelope for one escrow.
+///
+/// Soroban decodes `contracttype` structs by field name, so adding a field to
+/// `EscrowContract` in a later release would make every entry written by the
+/// previous version fail to decode and strand its funds. Wrapping the struct in
+/// a tagged enum keeps the layout self-describing: a future release adds a
+/// variant and teaches `upgrade_to_latest` how to read it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoredEscrow {
+    V1(EscrowContract),
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Admin,
     Paused,
     NextId,
+    /// Legacy, pre-envelope escrow entries. Still readable and still addressable
+    /// so old escrows can be found and migrated; never written to any more.
     Contract(u64),
+    /// Current envelope, `StoredEscrow`.
+    ContractV(u64),
     Reputation(Address),
 }
 
@@ -120,24 +140,53 @@ fn require_not_paused(env: &Env) -> Result<(), EscrowError> {
 }
 
 fn load(env: &Env, id: u64) -> Result<EscrowContract, EscrowError> {
+    if let Some(stored) = env
+        .storage()
+        .persistent()
+        .get::<_, StoredEscrow>(&DataKey::ContractV(id))
+    {
+        return Ok(upgrade_to_latest(stored));
+    }
+    // Entries written before the versioned envelope existed. Decoding does not
+    // migrate: `get_contract` is a read and must not write.
     env.storage()
         .persistent()
-        .get(&DataKey::Contract(id))
+        .get::<_, EscrowContract>(&DataKey::Contract(id))
+        .map(|c| upgrade_to_latest(StoredEscrow::V1(c)))
         .ok_or(EscrowError::ContractNotFound)
 }
 
+/// Writes the newest envelope and drops the legacy entry, so the first mutation
+/// of an old escrow migrates it. TTL is extended on the new key only.
 fn save(env: &Env, c: &EscrowContract) {
-    let key = DataKey::Contract(c.id);
-    env.storage().persistent().set(&key, c);
+    let key = DataKey::ContractV(c.id);
+    env.storage()
+        .persistent()
+        .set(&key, &StoredEscrow::V1(c.clone()));
     env.storage()
         .persistent()
         .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    let legacy = DataKey::Contract(c.id);
+    if env.storage().persistent().has(&legacy) {
+        env.storage().persistent().remove(&legacy);
+    }
 }
 
 fn bump_instance(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+}
+
+/// The single place a future storage version is taught to read.
+///
+/// Adding `V2(..)` means adding an arm here that converts `V2` into the current
+/// `EscrowContract`; every read path goes through this function, so nothing else
+/// needs to know which layouts exist.
+fn upgrade_to_latest(stored: StoredEscrow) -> EscrowContract {
+    match stored {
+        StoredEscrow::V1(c) => c,
+    }
 }
 
 fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amount: i128) {
@@ -411,6 +460,44 @@ impl Escrow {
             .get::<_, u64>(&DataKey::NextId)
             .unwrap_or(1)
             - 1
+    }
+
+    /// Re-encodes legacy escrow entries into the current storage envelope.
+    ///
+    /// Permissionless and idempotent: it only re-encodes values that are already
+    /// stored, so it cannot change an escrow's contents. Already-migrated and
+    /// unknown ids are skipped rather than rejected, so a caller can pass a batch
+    /// straight from `1..=contract_count()` without filtering. Returns how many
+    /// entries were actually migrated.
+    ///
+    /// Not pause-gated: this moves no value and rewrites no field, and blocking it
+    /// during an incident would only delay making old escrows reachable.
+    pub fn migrate_escrows(env: Env, ids: Vec<u64>) -> Result<u32, EscrowError> {
+        if ids.len() > MIGRATION_BATCH_MAX {
+            return Err(EscrowError::InvalidAmount);
+        }
+        let mut migrated: u32 = 0;
+        for id in ids.iter() {
+            let new_key = DataKey::ContractV(id);
+            if env.storage().persistent().has(&new_key) {
+                continue;
+            }
+            let legacy_key = DataKey::Contract(id);
+            if let Some(c) = env.storage().persistent().get::<_, EscrowContract>(&legacy_key) {
+                env.storage()
+                    .persistent()
+                    .set(&new_key, &StoredEscrow::V1(c));
+                env.storage().persistent().extend_ttl(
+                    &new_key,
+                    PERSISTENT_TTL_THRESHOLD,
+                    PERSISTENT_TTL_EXTEND,
+                );
+                env.storage().persistent().remove(&legacy_key);
+                migrated += 1;
+            }
+        }
+        bump_instance(&env);
+        Ok(migrated)
     }
 
     pub fn get_reputation(env: Env, freelancer: Address) -> Reputation {
