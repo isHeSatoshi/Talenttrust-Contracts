@@ -39,6 +39,10 @@ pub enum EscrowError {
     InvalidSplit = 14,
     InvalidRating = 15,
     ReputationAlreadyIssued = 16,
+    /// An amount, id or counter would have left the range of its integer type.
+    /// Added last: existing codes are mapped on by the frontend and backend, so
+    /// they must never be renumbered or reused.
+    ArithmeticOverflow = 17,
 }
 
 #[contracttype]
@@ -146,6 +150,51 @@ fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amoun
     }
 }
 
+/// `floor(held * bps / BPS_DENOMINATOR)`, computed so it cannot overflow.
+///
+/// The direct form multiplies first, so it is only valid while
+/// `held <= i128::MAX / BPS_DENOMINATOR`. Past that it traps, and because the
+/// release profile sets `overflow-checks = true` the trap is a panic the caller
+/// cannot handle. Splitting `held` by the denominator removes the wide product
+/// entirely.
+///
+/// # Correctness
+///
+/// Write `held = q * D + r` with `D = BPS_DENOMINATOR`, `q = held / D` and
+/// `r = held % D`, so `0 <= r < D` by the division algorithm. Then
+///
+/// ```text
+/// held * bps = (q * D + r) * bps = q * D * bps + r * bps
+/// ```
+///
+/// Dividing by `D` and taking the floor:
+///
+/// ```text
+/// floor(held * bps / D) = q * bps + floor(r * bps / D)
+/// ```
+///
+/// because `q * D * bps / D = q * bps` is an integer and `floor` distributes
+/// over an integer summand. The right-hand side is exactly what this function
+/// evaluates, so it equals `floor(held * bps / D)` for every `held` and `bps`.
+///
+/// # Bounds
+///
+/// Each step is proved to stay in range for all `held >= 0` and
+/// `0 <= bps <= D`:
+///
+/// - `q = held / D <= held`, so `q * bps <= q * D <= held <= i128::MAX`.
+/// - `r < D = 10_000` and `bps <= D = 10_000`, so `r * bps < 10^8`.
+/// - `q * bps + (r * bps) / D = floor(held * bps / D) <= floor(held * D / D) = held`,
+///   since `bps <= D`. So the result cannot exceed `held` either.
+///
+/// `held` is passed as a non-negative value; callers reach it through a checked
+/// subtraction, so a negative balance is reported as `ArithmeticOverflow`
+/// rather than silently producing a negative payout.
+fn split_by_bps(held: i128, bps: u32) -> i128 {
+    let bps = bps as i128;
+    (held / BPS_DENOMINATOR) * bps + ((held % BPS_DENOMINATOR) * bps) / BPS_DENOMINATOR
+}
+
 #[contractimpl]
 impl Escrow {
     /// One-time setup. Sets the admin that controls pausing and dispute resolution.
@@ -216,7 +265,10 @@ impl Escrow {
             });
         }
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        let next_id = id
+            .checked_add(1)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        env.storage().instance().set(&DataKey::NextId, &next_id);
         bump_instance(&env);
         let c = EscrowContract {
             id,
@@ -285,7 +337,11 @@ impl Escrow {
         if m.released {
             return Err(EscrowError::MilestoneAlreadyReleased);
         }
-        if c.funded_amount - c.released_amount < m.amount {
+        let available = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        if available < m.amount {
             return Err(EscrowError::InsufficientFunds);
         }
         transfer(
@@ -296,7 +352,10 @@ impl Escrow {
             m.amount,
         );
         m.released = true;
-        c.released_amount += m.amount;
+        c.released_amount = c
+            .released_amount
+            .checked_add(m.amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         c.milestones.set(index, m.clone());
         if c.milestones.iter().all(|x| x.released) {
             c.status = ContractStatus::Completed;
@@ -335,13 +394,23 @@ impl Escrow {
         if freelancer_bps as i128 > BPS_DENOMINATOR {
             return Err(EscrowError::InvalidSplit);
         }
-        let held = c.funded_amount - c.released_amount;
-        let to_freelancer = held * freelancer_bps as i128 / BPS_DENOMINATOR;
-        let to_client = held - to_freelancer;
+        let held = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        // Overflow-safe: see `split_by_bps` for the proof that this equals
+        // floor(held * freelancer_bps / BPS_DENOMINATOR) for every `held`.
+        let to_freelancer = split_by_bps(held, freelancer_bps);
+        let to_client = held
+            .checked_sub(to_freelancer)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         let this = env.current_contract_address();
         transfer(&env, &c.token, &this, &c.freelancer, to_freelancer);
         transfer(&env, &c.token, &this, &c.client, to_client);
-        c.released_amount += to_freelancer;
+        c.released_amount = c
+            .released_amount
+            .checked_add(to_freelancer)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         c.funded_amount = c.released_amount;
         c.status = ContractStatus::Resolved;
         save(&env, &c);
@@ -358,7 +427,10 @@ impl Escrow {
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
         }
-        let refund = c.funded_amount - c.released_amount;
+        let refund = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         transfer(
             &env,
             &c.token,
@@ -388,8 +460,14 @@ impl Escrow {
         }
         let key = DataKey::Reputation(c.freelancer.clone());
         let mut rep: Reputation = env.storage().persistent().get(&key).unwrap_or_default();
-        rep.completed_contracts += 1;
-        rep.total_rating += rating;
+        rep.completed_contracts = rep
+            .completed_contracts
+            .checked_add(1)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        rep.total_rating = rep
+            .total_rating
+            .checked_add(rating)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         env.storage().persistent().set(&key, &rep);
         env.storage()
             .persistent()
@@ -406,11 +484,15 @@ impl Escrow {
     }
 
     pub fn contract_count(env: Env) -> u64 {
+        // Saturating, not checked: this is a read-only getter with no `Result`
+        // to carry an error, and the counter starts at 1, so the subtraction
+        // cannot underflow in practice. Saturating keeps the signature and
+        // still removes the panic path.
         env.storage()
             .instance()
             .get::<_, u64>(&DataKey::NextId)
             .unwrap_or(1)
-            - 1
+            .saturating_sub(1)
     }
 
     pub fn get_reputation(env: Env, freelancer: Address) -> Reputation {

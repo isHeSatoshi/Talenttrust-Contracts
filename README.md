@@ -29,13 +29,55 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `deposit_funds(id, amount)` | client | Transfer tokens into escrow (cannot exceed total) |
 | `release_milestone(id, index)` | client | Pay the freelancer for a milestone |
 | `open_dispute(id, caller)` | client or freelancer | Freeze the escrow pending resolution |
-| `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance (basis points to freelancer) |
+| `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance (basis points to freelancer); exact for any held balance |
 | `cancel_contract(id)` | client | Refund unreleased funds and close |
 | `issue_reputation(id, rating)` | client | Rate a completed job (1-5), once |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
 | `get_contract(id)`, `contract_count()`, `get_reputation(addr)`, `get_admin()`, `version()` | - | Reads |
 
 Status flow: `Created -> Funded -> Completed`, with `Disputed -> Resolved` and `Cancelled` side exits.
+
+### Errors
+
+`EscrowError` is part of the public interface: the frontend and backend map on the
+numeric code, so **codes are append-only**. A new variant takes the next free
+number and is never inserted in the middle; existing codes are never renumbered or
+reused, because a renumbering silently changes the meaning of a code already
+deployed against.
+
+| Code | Name | Raised when |
+| --- | --- | --- |
+| 1 | `AlreadyInitialized` | `initialize` called twice |
+| 2 | `NotInitialized` | admin not set |
+| 3 | `Unauthorized` | caller is not the admin or a party |
+| 4 | `Paused` | a mutation while the circuit breaker is on |
+| 5 | `ContractNotFound` | unknown escrow id |
+| 6 | `InvalidParties` | client equals freelancer |
+| 7 | `InvalidMilestones` | zero milestones, or more than 20 |
+| 8 | `InvalidAmount` | non-positive amount, or the milestones sum past `i128::MAX` |
+| 9 | `OverFunded` | deposit would exceed the contract total |
+| 10 | `InvalidStatus` | the call is not valid in the current status |
+| 11 | `MilestoneNotFound` | index out of range |
+| 12 | `MilestoneAlreadyReleased` | releasing a released milestone |
+| 13 | `InsufficientFunds` | unreleased balance is below the milestone |
+| 14 | `InvalidSplit` | `freelancer_bps` above 10 000 |
+| 15 | `InvalidRating` | rating outside 1..=5 |
+| 16 | `ReputationAlreadyIssued` | rating a job twice |
+| 17 | `ArithmeticOverflow` | an amount, id or counter would leave its integer type |
+
+### Events
+
+| Topics | Data |
+| --- | --- |
+| `init` | admin |
+| `paused` | `bool` |
+| `created`, `id` | (client, freelancer, total) |
+| `deposit`, `id` | amount |
+| `release`, `id` | (milestone index, amount) |
+| `dispute`, `id` | caller |
+| `resolved`, `id` | (to_freelancer, to_client) |
+| `cancel`, `id` | refund |
+| `rep`, `id` | (freelancer, rating) |
 
 ## Build and test
 
