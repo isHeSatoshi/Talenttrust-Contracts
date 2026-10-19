@@ -6,8 +6,10 @@
 //! 3. The client funds the escrow with `deposit_funds` (real token transfer into the contract).
 //! 4. The client approves work with `release_milestone`, paying the freelancer per milestone.
 //! 5. Either party may `open_dispute`; the admin settles with `resolve_dispute`.
-//! 6. The client can `cancel_contract` before completion to recover unreleased funds.
-//! 7. After completion the client may `issue_reputation` for the freelancer.
+//! 6. Or the two parties agree a split themselves: `propose_settlement` then
+//!    `accept_settlement`, which closes the escrow without the admin.
+//! 7. The client can `cancel_contract` before completion to recover unreleased funds.
+//! 8. After completion the client may `issue_reputation` for the freelancer.
 #![no_std]
 
 use soroban_sdk::{
@@ -39,6 +41,8 @@ pub enum EscrowError {
     InvalidSplit = 14,
     InvalidRating = 15,
     ReputationAlreadyIssued = 16,
+    /// The acceptor is not the other party, or did not echo the proposed amount.
+    SettlementMismatch = 17,
 }
 
 #[contracttype]
@@ -81,6 +85,20 @@ pub struct Reputation {
     pub total_rating: u32,
 }
 
+/// A pending, two-signature agreement to close an escrow at a fixed split.
+///
+/// `freelancer_amount` is an absolute amount, not a ratio, and is only ever
+/// honoured against the balance that existed when it was proposed: `deposit_funds`
+/// and `release_milestone` both delete the proposal, so it can never be accepted
+/// against a balance it was not quoted for.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Settlement {
+    pub proposer: Address,
+    pub freelancer_amount: i128,
+    pub created_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -89,6 +107,7 @@ enum DataKey {
     NextId,
     Contract(u64),
     Reputation(Address),
+    Settlement(u64),
 }
 
 #[contract]
@@ -143,6 +162,17 @@ fn bump_instance(env: &Env) {
 fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amount: i128) {
     if amount > 0 {
         token::Client::new(env, token_addr).transfer(from, to, &amount);
+    }
+}
+
+/// Drops any pending settlement proposal.
+///
+/// Called from every path that moves `funded_amount` or `released_amount`, so a
+/// proposal can only ever be accepted against the balance it was quoted for.
+fn clear_settlement(env: &Env, id: u64) {
+    let key = DataKey::Settlement(id);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
     }
 }
 
@@ -265,6 +295,8 @@ impl Escrow {
         if c.funded_amount == c.total_amount {
             c.status = ContractStatus::Funded;
         }
+        // The balance changed, so any pending split no longer refers to it.
+        clear_settlement(&env, id);
         save(&env, &c);
         env.events().publish((symbol_short!("deposit"), id), amount);
         Ok(())
@@ -301,6 +333,8 @@ impl Escrow {
         if c.milestones.iter().all(|x| x.released) {
             c.status = ContractStatus::Completed;
         }
+        // The balance changed, so any pending split no longer refers to it.
+        clear_settlement(&env, id);
         save(&env, &c);
         env.events()
             .publish((symbol_short!("release"), id), (index, m.amount));
@@ -348,6 +382,141 @@ impl Escrow {
         env.events()
             .publish((symbol_short!("resolved"), id), (to_freelancer, to_client));
         Ok(())
+    }
+
+    /// Either party proposes closing the escrow at an agreed split, without the admin.
+    ///
+    /// `freelancer_amount` is an absolute amount of the held balance
+    /// (`funded_amount - released_amount`); the rest goes to the client. Any
+    /// earlier proposal is replaced, so only one can be pending at a time.
+    pub fn propose_settlement(
+        env: Env,
+        id: u64,
+        proposer: Address,
+        freelancer_amount: i128,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        proposer.require_auth();
+        if proposer != c.client && proposer != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Disputed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let held = c.funded_amount - c.released_amount;
+        if freelancer_amount < 0 || freelancer_amount > held {
+            return Err(EscrowError::InvalidAmount);
+        }
+        let settlement = Settlement {
+            proposer: proposer.clone(),
+            freelancer_amount,
+            created_at: env.ledger().timestamp(),
+        };
+        let key = DataKey::Settlement(id);
+        env.storage().persistent().set(&key, &settlement);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND,
+        );
+        env.events().publish(
+            (symbol_short!("settle_p"), id),
+            (proposer, freelancer_amount),
+        );
+        Ok(())
+    }
+
+    /// The other party accepts, echoing the proposed amount exactly.
+    ///
+    /// Echoing the amount is what makes this safe to sign: the proposer cannot
+    /// swap the split between the counterparty reading it and the counterparty
+    /// signing it. A stale proposal (replaced by a newer one) fails here rather
+    /// than settling at a split the acceptor never saw. Both sides are paid and
+    /// the escrow closes as `Resolved`, so the admin can no longer intervene.
+    pub fn accept_settlement(
+        env: Env,
+        id: u64,
+        acceptor: Address,
+        freelancer_amount: i128,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        acceptor.require_auth();
+        if acceptor != c.client && acceptor != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Disputed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let key = DataKey::Settlement(id);
+        let settlement: Settlement = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::InvalidStatus)?;
+        if acceptor == settlement.proposer || freelancer_amount != settlement.freelancer_amount {
+            return Err(EscrowError::SettlementMismatch);
+        }
+        let held = c.funded_amount - c.released_amount;
+        // Redundant today: deposit_funds and release_milestone both delete the
+        // proposal, so `held` cannot have moved since it was written. Kept as a
+        // fail-closed guard in case a future path adjusts the balance.
+        if settlement.freelancer_amount < 0 || settlement.freelancer_amount > held {
+            return Err(EscrowError::SettlementMismatch);
+        }
+        let to_freelancer = settlement.freelancer_amount;
+        let to_client = held - to_freelancer;
+        let this = env.current_contract_address();
+        transfer(&env, &c.token, &this, &c.freelancer, to_freelancer);
+        transfer(&env, &c.token, &this, &c.client, to_client);
+        env.storage().persistent().remove(&key);
+        c.released_amount += to_freelancer;
+        c.funded_amount = c.released_amount;
+        c.status = ContractStatus::Resolved;
+        save(&env, &c);
+        env.events()
+            .publish((symbol_short!("settled"), id), (to_freelancer, to_client));
+        Ok(())
+    }
+
+    /// The proposer retracts their own pending proposal.
+    ///
+    /// Deliberately not pause-gated: it only ever removes state, so a party must
+    /// always be able to pull an offer they no longer stand behind. Only the
+    /// proposer may withdraw, so a counterparty cannot erase an offer it simply
+    /// does not want (it can decline by not accepting, and the next deposit or
+    /// release invalidates the proposal anyway).
+    pub fn withdraw_settlement(env: Env, id: u64, proposer: Address) -> Result<(), EscrowError> {
+        load(&env, id)?;
+        proposer.require_auth();
+        let key = DataKey::Settlement(id);
+        let settlement: Settlement = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::InvalidStatus)?;
+        if proposer != settlement.proposer {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish((symbol_short!("settle_w"), id), proposer);
+        Ok(())
+    }
+
+    /// Reads the pending settlement proposal, if any.
+    ///
+    /// Returns `ContractNotFound` for an unknown escrow, so a caller can tell
+    /// "no such escrow" apart from "no proposal pending".
+    pub fn get_settlement(env: Env, id: u64) -> Result<Option<Settlement>, EscrowError> {
+        load(&env, id)?;
+        Ok(env.storage().persistent().get(&DataKey::Settlement(id)))
     }
 
     /// Client cancels the agreement and recovers any unreleased funds.
