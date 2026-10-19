@@ -16,6 +16,27 @@ use soroban_sdk::{
 
 pub const MAX_MILESTONES: u32 = 20;
 pub const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Pause categories, one bit each. An entry point is blocked when its bit is set
+/// in the stored flag word.
+///
+/// The point of splitting these is that an incident usually calls for stopping
+/// *new money coming in* while still letting users get *out*. A single boolean
+/// cannot express that, so pausing for a deposit bug also trapped every escrow.
+pub const PAUSE_CREATE: u32 = 1;
+pub const PAUSE_DEPOSIT: u32 = 2;
+pub const PAUSE_RELEASE: u32 = 4;
+pub const PAUSE_DISPUTE: u32 = 8;
+pub const PAUSE_CANCEL: u32 = 16;
+pub const PAUSE_REPUTATION: u32 = 32;
+/// Every category. The only value `set_pause_flags` accepts besides a subset.
+pub const PAUSE_ALL: u32 = PAUSE_CREATE
+    | PAUSE_DEPOSIT
+    | PAUSE_RELEASE
+    | PAUSE_DISPUTE
+    | PAUSE_CANCEL
+    | PAUSE_REPUTATION;
+
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280; // ~1 day
 const PERSISTENT_TTL_EXTEND: u32 = 518_400; // ~30 days
 
@@ -85,7 +106,12 @@ pub struct Reputation {
 #[derive(Clone)]
 enum DataKey {
     Admin,
+    /// Legacy boolean pause, kept in sync with `PauseFlags` so anything still
+    /// reading it sees a consistent value. Also read for backwards
+    /// compatibility: see `pause_flags`.
     Paused,
+    /// The pause bitmask. Source of truth once written.
+    PauseFlags,
     NextId,
     Contract(u64),
     Reputation(Address),
@@ -107,13 +133,41 @@ fn require_admin(env: &Env) -> Result<Address, EscrowError> {
     Ok(a)
 }
 
-fn require_not_paused(env: &Env) -> Result<(), EscrowError> {
-    if env
-        .storage()
-        .instance()
-        .get::<_, bool>(&DataKey::Paused)
-        .unwrap_or(false)
-    {
+/// The current pause bitmask.
+///
+/// Falls back to the legacy boolean when no flags have ever been written. That
+/// covers a contract that was paused under the old code and then upgraded: it
+/// stored only `Paused = true`, so without this it would silently come back
+/// unpaused, which is the one direction a pause must never fail in.
+///
+/// A stored `Some(0)` means "explicitly unpaused" and is *not* overridden by the
+/// legacy key, so an admin can always clear a legacy pause by calling
+/// `set_pause_flags(0)`.
+fn pause_flags(env: &Env) -> u32 {
+    match env.storage().instance().get::<_, u32>(&DataKey::PauseFlags) {
+        Some(flags) => flags,
+        None => {
+            let legacy = env
+                .storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Paused)
+                .unwrap_or(false);
+            if legacy {
+                PAUSE_ALL
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Reject an operation whose pause category is set.
+///
+/// `op` is one of the `PAUSE_*` constants. A caller passes a single bit; the
+/// check is `flags & op != 0`, so any category being paused blocks that
+/// operation and unrelated categories are unaffected.
+fn require_not_paused(env: &Env, op: u32) -> Result<(), EscrowError> {
+    if pause_flags(env) & op != 0 {
         return Err(EscrowError::Paused);
     }
     Ok(())
@@ -170,19 +224,55 @@ impl Escrow {
         admin(&env)
     }
 
+    /// Sets or clears the whole pause.
+    ///
+    /// `true` is `PAUSE_ALL`, `false` is `0`. Kept because it is the existing
+    /// ABI and the thing operators reach for in an incident; `set_pause_flags`
+    /// is the granular version. The `paused` event is unchanged.
     pub fn set_paused(env: Env, paused: bool) -> Result<(), EscrowError> {
         require_admin(&env)?;
-        env.storage().instance().set(&DataKey::Paused, &paused);
-        bump_instance(&env);
+        Self::write_pause_flags(&env, if paused { PAUSE_ALL } else { 0 });
         env.events().publish((symbol_short!("paused"),), paused);
         Ok(())
     }
 
-    pub fn is_paused(env: Env) -> bool {
+    /// Sets the pause bitmask directly. Admin only.
+    ///
+    /// Bits outside `PAUSE_ALL` are rejected: a stray bit would be stored,
+    /// never checked by any entry point, and silently do nothing, which is
+    /// worse than an error because the operator would believe it took effect.
+    pub fn set_pause_flags(env: Env, flags: u32) -> Result<(), EscrowError> {
+        require_admin(&env)?;
+        if flags & !PAUSE_ALL != 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        Self::write_pause_flags(&env, flags);
+        env.events().publish((symbol_short!("pause"),), flags);
+        Ok(())
+    }
+
+    /// Write the flag word and keep the legacy boolean in step.
+    fn write_pause_flags(env: &Env, flags: u32) {
+        env.storage().instance().set(&DataKey::PauseFlags, &flags);
+        // Mirrored so anything still reading the old key agrees with `is_paused`.
         env.storage()
             .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+            .set(&DataKey::Paused, &(flags != 0));
+        bump_instance(env);
+    }
+
+    /// `true` if **any** category is paused.
+    ///
+    /// Note this is not "the contract is fully stopped": a partial pause returns
+    /// `true` here while most entry points still work. Use `get_pause_flags` to
+    /// see which categories are actually closed.
+    pub fn is_paused(env: Env) -> bool {
+        pause_flags(&env) != 0
+    }
+
+    /// The raw pause bitmask.
+    pub fn get_pause_flags(env: Env) -> u32 {
+        pause_flags(&env)
     }
 
     /// Creates a new escrow agreement. Returns the escrow id.
@@ -194,7 +284,7 @@ impl Escrow {
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, EscrowError> {
         admin(&env)?;
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CREATE)?;
         client.require_auth();
         if client == freelancer {
             return Err(EscrowError::InvalidParties);
@@ -238,7 +328,7 @@ impl Escrow {
 
     /// Client deposits `amount` of the escrow token into the contract.
     pub fn deposit_funds(env: Env, id: u64, amount: i128) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_DEPOSIT)?;
         let mut c = load(&env, id)?;
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
@@ -272,7 +362,7 @@ impl Escrow {
 
     /// Client approves a milestone and the freelancer is paid.
     pub fn release_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_RELEASE)?;
         let mut c = load(&env, id)?;
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
@@ -309,7 +399,7 @@ impl Escrow {
 
     /// Either party may raise a dispute, freezing releases until the admin resolves it.
     pub fn open_dispute(env: Env, id: u64, caller: Address) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_DISPUTE)?;
         let mut c = load(&env, id)?;
         caller.require_auth();
         if caller != c.client && caller != c.freelancer {
@@ -352,7 +442,7 @@ impl Escrow {
 
     /// Client cancels the agreement and recovers any unreleased funds.
     pub fn cancel_contract(env: Env, id: u64) -> Result<(), EscrowError> {
-        require_not_paused(&env)?;
+        require_not_paused(&env, PAUSE_CANCEL)?;
         let mut c = load(&env, id)?;
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
@@ -374,7 +464,14 @@ impl Escrow {
     }
 
     /// After completion the client may rate the freelancer (1..=5) once per contract.
+    ///
+    /// Pause-gated like the other mutating entry points. It was the one that was
+    /// missed, which meant a reputation-farming exploit could not be frozen
+    /// while it was investigated: reputation writes are permanent and
+    /// `ReputationAlreadyIssued` makes them un-repeatable, so a bad write cannot
+    /// be corrected later.
     pub fn issue_reputation(env: Env, id: u64, rating: u32) -> Result<(), EscrowError> {
+        require_not_paused(&env, PAUSE_REPUTATION)?;
         let mut c = load(&env, id)?;
         c.client.require_auth();
         if c.status != ContractStatus::Completed {
