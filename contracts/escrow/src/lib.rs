@@ -16,6 +16,13 @@ use soroban_sdk::{
 
 pub const MAX_MILESTONES: u32 = 20;
 pub const BPS_DENOMINATOR: i128 = 10_000;
+/// Share of an escrow's total required as a dispute bond, in basis points (2%).
+pub const DISPUTE_BOND_BPS: i128 = 200;
+/// Floor for the dispute bond, in the escrow token's smallest unit.
+///
+/// Deliberately `0`: the bond is purely proportional, so a tiny escrow is not
+/// priced out of disputing. Raise this to give every dispute a non-zero cost.
+pub const DISPUTE_BOND_MIN: i128 = 0;
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280; // ~1 day
 const PERSISTENT_TTL_EXTEND: u32 = 518_400; // ~30 days
 
@@ -89,6 +96,8 @@ enum DataKey {
     NextId,
     Contract(u64),
     Reputation(Address),
+    /// The dispute bond held for an escrow: `(opener, amount)`.
+    DisputeBond(u64),
 }
 
 #[contract]
@@ -144,6 +153,32 @@ fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amoun
     if amount > 0 {
         token::Client::new(env, token_addr).transfer(from, to, &amount);
     }
+}
+
+/// The bond a party must stake to open a dispute:
+/// `max(DISPUTE_BOND_MIN, total_amount * DISPUTE_BOND_BPS / BPS_DENOMINATOR)`.
+///
+/// Computed by splitting `total_amount` into quotient and remainder first, so no
+/// intermediate can overflow `i128` for any representable total while the result
+/// is still exactly the floor of the single-expression form:
+/// `floor((q*10000 + r) * 200 / 10000) == q*200 + floor(r*200 / 10000)`.
+fn dispute_bond(c: &EscrowContract) -> i128 {
+    let proportional = (c.total_amount / BPS_DENOMINATOR) * DISPUTE_BOND_BPS
+        + (c.total_amount % BPS_DENOMINATOR) * DISPUTE_BOND_BPS / BPS_DENOMINATOR;
+    if proportional > DISPUTE_BOND_MIN {
+        proportional
+    } else {
+        DISPUTE_BOND_MIN
+    }
+}
+
+/// Reads the bond held for an escrow, defaulting to `(client, 0)` when none was
+/// ever staked (an escrow disputed before this feature existed).
+fn dispute_bond_of(env: &Env, c: &EscrowContract) -> (Address, i128) {
+    env.storage()
+        .persistent()
+        .get::<_, (Address, i128)>(&DataKey::DisputeBond(c.id))
+        .unwrap_or((c.client.clone(), 0))
 }
 
 #[contractimpl]
@@ -308,6 +343,11 @@ impl Escrow {
     }
 
     /// Either party may raise a dispute, freezing releases until the admin resolves it.
+    ///
+    /// Opening a dispute stakes a bond (`dispute_bond`) from the caller into the
+    /// contract, so freezing an escrow is not free. The bond is held separately
+    /// from the escrow balance and is never part of the split; the admin decides
+    /// who gets it in `resolve_dispute`.
     pub fn open_dispute(env: Env, id: u64, caller: Address) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let mut c = load(&env, id)?;
@@ -318,15 +358,43 @@ impl Escrow {
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
         }
+        let bond = dispute_bond(&c);
+        // Take the bond *before* flipping the status: a caller who cannot pay
+        // must not be able to freeze the escrow. `transfer` is a no-op for a
+        // zero bond, which is what a tiny total rounds down to.
+        transfer(
+            &env,
+            &c.token,
+            &caller,
+            &env.current_contract_address(),
+            bond,
+        );
+        let key = DataKey::DisputeBond(id);
+        env.storage().persistent().set(&key, &(caller.clone(), bond));
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND,
+        );
         c.status = ContractStatus::Disputed;
         save(&env, &c);
-        env.events().publish((symbol_short!("dispute"), id), caller);
+        env.events()
+            .publish((symbol_short!("dispute"), id), (caller, bond));
         Ok(())
     }
 
     /// Admin resolves a dispute, paying `freelancer_bps` (0..=10000) of the escrowed
     /// balance to the freelancer and refunding the rest to the client.
-    pub fn resolve_dispute(env: Env, id: u64, freelancer_bps: u32) -> Result<(), EscrowError> {
+    ///
+    /// `bond_to_opener` decides the dispute bond: `true` returns it to whoever
+    /// opened the dispute, `false` forfeits it to the other party. The bond is
+    /// settled outside `held`, so it never changes the split.
+    pub fn resolve_dispute(
+        env: Env,
+        id: u64,
+        freelancer_bps: u32,
+        bond_to_opener: bool,
+    ) -> Result<(), EscrowError> {
         require_admin(&env)?;
         let mut c = load(&env, id)?;
         if c.status != ContractStatus::Disputed {
@@ -341,13 +409,37 @@ impl Escrow {
         let this = env.current_contract_address();
         transfer(&env, &c.token, &this, &c.freelancer, to_freelancer);
         transfer(&env, &c.token, &this, &c.client, to_client);
+
+        // The bond is not part of `held`: it is paid out on top of the split, so
+        // the contract ends at a zero balance for this escrow.
+        let (opener, bond) = dispute_bond_of(&env, &c);
+        let bond_recipient = if bond_to_opener {
+            opener.clone()
+        } else if opener == c.freelancer {
+            c.client.clone()
+        } else {
+            c.freelancer.clone()
+        };
+        transfer(&env, &c.token, &this, &bond_recipient, bond);
+        let bond_key = DataKey::DisputeBond(id);
+        if env.storage().persistent().has(&bond_key) {
+            env.storage().persistent().remove(&bond_key);
+        }
+
         c.released_amount += to_freelancer;
         c.funded_amount = c.released_amount;
         c.status = ContractStatus::Resolved;
         save(&env, &c);
-        env.events()
-            .publish((symbol_short!("resolved"), id), (to_freelancer, to_client));
+        env.events().publish(
+            (symbol_short!("resolved"), id),
+            (to_freelancer, to_client, bond_recipient, bond),
+        );
         Ok(())
+    }
+
+    /// Reads the dispute bond held for an escrow, if one was staked.
+    pub fn get_dispute_bond(env: Env, id: u64) -> Option<(Address, i128)> {
+        env.storage().persistent().get(&DataKey::DisputeBond(id))
     }
 
     /// Client cancels the agreement and recovers any unreleased funds.
