@@ -3,11 +3,14 @@
 //! Lifecycle:
 //! 1. `initialize(admin)` once after deployment.
 //! 2. A client calls `create_contract(client, freelancer, token, milestone_amounts)`.
-//! 3. The client funds the escrow with `deposit_funds` (real token transfer into the contract).
-//! 4. The client approves work with `release_milestone`, paying the freelancer per milestone.
-//! 5. Either party may `open_dispute`; the admin settles with `resolve_dispute`.
-//! 6. The client can `cancel_contract` before completion to recover unreleased funds.
-//! 7. After completion the client may `issue_reputation` for the freelancer.
+//! 3. The named freelancer calls `accept_contract` (or `decline_contract` to refuse).
+//!    An escrow is inert until then: it cannot be funded, and no reputation can be
+//!    written for it.
+//! 4. The client funds the escrow with `deposit_funds` (real token transfer into the contract).
+//! 5. The client approves work with `release_milestone`, paying the freelancer per milestone.
+//! 6. Either party may `open_dispute`; the admin settles with `resolve_dispute`.
+//! 7. The client can `cancel_contract` before completion to recover unreleased funds.
+//! 8. After completion the client may `issue_reputation` for the freelancer.
 #![no_std]
 
 use soroban_sdk::{
@@ -39,6 +42,8 @@ pub enum EscrowError {
     InvalidSplit = 14,
     InvalidRating = 15,
     ReputationAlreadyIssued = 16,
+    /// The freelancer has not accepted the escrow yet.
+    NotAccepted = 17,
 }
 
 #[contracttype]
@@ -89,6 +94,8 @@ enum DataKey {
     NextId,
     Contract(u64),
     Reputation(Address),
+    /// Whether the named freelancer has signed on. Absent means not accepted.
+    Accepted(u64),
 }
 
 #[contract]
@@ -144,6 +151,31 @@ fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amoun
     if amount > 0 {
         token::Client::new(env, token_addr).transfer(from, to, &amount);
     }
+}
+
+fn accepted(env: &Env, id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get::<_, bool>(&DataKey::Accepted(id))
+        .unwrap_or(false)
+}
+
+fn set_accepted(env: &Env, id: u64, value: bool) {
+    let key = DataKey::Accepted(id);
+    env.storage().persistent().set(&key, &value);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+}
+
+/// An escrow is inert until the named freelancer has signed on. Without this the
+/// client alone decides who "worked" for them, which is enough to write ratings
+/// against any address via `issue_reputation`.
+fn require_accepted(env: &Env, id: u64) -> Result<(), EscrowError> {
+    if !accepted(env, id) {
+        return Err(EscrowError::NotAccepted);
+    }
+    Ok(())
 }
 
 #[contractimpl]
@@ -231,16 +263,85 @@ impl Escrow {
             reputation_issued: false,
         };
         save(&env, &c);
+        // Written explicitly rather than left absent, so the key exists from the
+        // moment the escrow does and "not accepted" is a stored fact.
+        set_accepted(&env, id, false);
         env.events()
             .publish((symbol_short!("created"), id), (client, freelancer, total));
         Ok(id)
     }
 
+    /// The named freelancer signs on, activating the escrow.
+    ///
+    /// One-shot: a second call is rejected rather than being a no-op, so the
+    /// acceptance timestamp in the event log is unambiguous. The escrow must
+    /// still be `Created`, so acceptance cannot resurrect a cancelled one.
+    pub fn accept_contract(env: Env, id: u64) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        c.freelancer.require_auth();
+        if c.status != ContractStatus::Created {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if accepted(&env, id) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        set_accepted(&env, id, true);
+        env.events()
+            .publish((symbol_short!("accepted"), id), c.freelancer);
+        Ok(())
+    }
+
+    /// The freelancer refuses the job. Only valid before accepting.
+    ///
+    /// Refunds whatever the escrow holds back to the client, so a refusal can
+    /// never strand funds. Note that this refund is unreachable today: funding
+    /// requires acceptance and declining requires the absence of acceptance, so
+    /// `funded_amount` is always zero here. It is kept so the invariant holds by
+    /// construction rather than by the ordering of two guards.
+    pub fn decline_contract(env: Env, id: u64) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        c.freelancer.require_auth();
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if accepted(&env, id) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let refund = c.funded_amount - c.released_amount;
+        transfer(
+            &env,
+            &c.token,
+            &env.current_contract_address(),
+            &c.client,
+            refund,
+        );
+        c.funded_amount = c.released_amount;
+        c.status = ContractStatus::Cancelled;
+        save(&env, &c);
+        env.events()
+            .publish((symbol_short!("declined"), id), (c.freelancer, refund));
+        Ok(())
+    }
+
+    /// Whether the named freelancer has accepted the escrow.
+    ///
+    /// Returns `false` for an unknown id as well as for a pending one; use
+    /// `get_contract` when the caller needs to tell those apart.
+    pub fn is_accepted(env: Env, id: u64) -> bool {
+        accepted(&env, id)
+    }
+
     /// Client deposits `amount` of the escrow token into the contract.
+    ///
+    /// Requires the freelancer to have accepted first: money must not move into
+    /// an escrow the named freelancer never agreed to.
     pub fn deposit_funds(env: Env, id: u64, amount: i128) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let mut c = load(&env, id)?;
         c.client.require_auth();
+        require_accepted(&env, id)?;
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
         }
@@ -269,7 +370,6 @@ impl Escrow {
         env.events().publish((symbol_short!("deposit"), id), amount);
         Ok(())
     }
-
     /// Client approves a milestone and the freelancer is paid.
     pub fn release_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
@@ -374,9 +474,16 @@ impl Escrow {
     }
 
     /// After completion the client may rate the freelancer (1..=5) once per contract.
+    ///
+    /// Acceptance is re-checked here as defence in depth. It is unreachable
+    /// today: `Completed` can only be reached through `release_milestone`, which
+    /// needs a funded escrow, and funding already requires acceptance. The check
+    /// is what makes "no reputation for a freelancer who never accepted" hold by
+    /// construction rather than by reasoning about the call graph.
     pub fn issue_reputation(env: Env, id: u64, rating: u32) -> Result<(), EscrowError> {
         let mut c = load(&env, id)?;
         c.client.require_auth();
+        require_accepted(&env, id)?;
         if c.status != ContractStatus::Completed {
             return Err(EscrowError::InvalidStatus);
         }

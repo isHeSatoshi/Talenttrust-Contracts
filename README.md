@@ -26,16 +26,40 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | --- | --- | --- |
 | `initialize(admin)` | admin | One-time setup |
 | `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones |
-| `deposit_funds(id, amount)` | client | Transfer tokens into escrow (cannot exceed total) |
+| `accept_contract(id)` | freelancer | Sign on, activating the escrow (once) |
+| `decline_contract(id)` | freelancer | Refuse the job before accepting; refunds and cancels |
+| `deposit_funds(id, amount)` | client | Transfer tokens into escrow (requires acceptance) |
 | `release_milestone(id, index)` | client | Pay the freelancer for a milestone |
 | `open_dispute(id, caller)` | client or freelancer | Freeze the escrow pending resolution |
 | `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance (basis points to freelancer) |
 | `cancel_contract(id)` | client | Refund unreleased funds and close |
 | `issue_reputation(id, rating)` | client | Rate a completed job (1-5), once |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
-| `get_contract(id)`, `contract_count()`, `get_reputation(addr)`, `get_admin()`, `version()` | - | Reads |
+| `get_contract(id)`, `contract_count()`, `get_reputation(addr)`, `get_admin()`, `is_accepted(id)`, `version()` | - | Reads |
 
 Status flow: `Created -> Funded -> Completed`, with `Disputed -> Resolved` and `Cancelled` side exits.
+
+### Freelancer acceptance
+
+`create_contract` only requires the client's signature, so without a second step a
+client could name any address as the freelancer, fund the escrow, release it, and
+then write ratings against that address with `issue_reputation`. The escrow is
+therefore inert until the named freelancer calls `accept_contract`:
+
+- `deposit_funds` returns `NotAccepted` before acceptance.
+- `issue_reputation` also requires acceptance, so no rating can be written for a
+  freelancer who never signed on.
+- `decline_contract` is only valid *before* acceptance and refunds any deposit to
+  the client, then sets `Cancelled`. Acceptance is one-shot and only valid while
+  the escrow is `Created`, so a declined or cancelled escrow cannot be revived.
+- State is stored under `DataKey::Accepted(id) -> bool`, written as `false` at
+  creation.
+
+| Error | Meaning |
+| --- | --- |
+| `NotAccepted = 17` | The freelancer has not accepted the escrow yet |
+
+Events: `accepted(id) -> freelancer`, `declined(id) -> (freelancer, refund)`.
 
 ## Build and test
 
