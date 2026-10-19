@@ -6,7 +6,8 @@
 //! 3. The client funds the escrow with `deposit_funds` (real token transfer into the contract).
 //! 4. The client approves work with `release_milestone`, paying the freelancer per milestone.
 //! 5. Either party may `open_dispute`; the admin settles with `resolve_dispute`.
-//! 6. The client can `cancel_contract` before completion to recover unreleased funds.
+//! 6. The client can `cancel_contract`, or the freelancer can `resign`, to close
+//!    early and refund everything unreleased to the client.
 //! 7. After completion the client may `issue_reputation` for the freelancer.
 #![no_std]
 
@@ -89,6 +90,8 @@ enum DataKey {
     NextId,
     Contract(u64),
     Reputation(Address),
+    /// Whether the freelancer resigned from an escrow. Absent means they did not.
+    Resigned(u64),
 }
 
 #[contract]
@@ -144,6 +147,24 @@ fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amoun
     if amount > 0 {
         token::Client::new(env, token_addr).transfer(from, to, &amount);
     }
+}
+
+/// Returns everything the escrow still holds to the client and closes it as
+/// `Cancelled`, in place. Shared by `cancel_contract` and `resign` so the two
+/// exits cannot drift apart — the destination is hardcoded to the client, which
+/// is what makes resignation safe to allow.
+fn refund_client_and_close(env: &Env, c: &mut EscrowContract) -> i128 {
+    let refund = c.funded_amount - c.released_amount;
+    transfer(
+        env,
+        &c.token,
+        &env.current_contract_address(),
+        &c.client,
+        refund,
+    );
+    c.funded_amount = c.released_amount;
+    c.status = ContractStatus::Cancelled;
+    refund
 }
 
 #[contractimpl]
@@ -358,19 +379,48 @@ impl Escrow {
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
         }
-        let refund = c.funded_amount - c.released_amount;
-        transfer(
-            &env,
-            &c.token,
-            &env.current_contract_address(),
-            &c.client,
-            refund,
-        );
-        c.funded_amount = c.released_amount;
-        c.status = ContractStatus::Cancelled;
+        let refund = refund_client_and_close(&env, &mut c);
         save(&env, &c);
         env.events().publish((symbol_short!("cancel"), id), refund);
         Ok(())
+    }
+
+    /// The freelancer withdraws from the job, refunding the client in full.
+    ///
+    /// Strictly non-harmful to the client: milestones already released stay paid
+    /// and everything still held goes back, so the client ends up no worse off
+    /// than if the freelancer had simply stopped responding — which is the
+    /// alternative today, since `cancel_contract` is the client's call and
+    /// `open_dispute` drags the admin into a non-contentious outcome.
+    ///
+    /// Recorded under `DataKey::Resigned(id)` so reputation logic and UIs can
+    /// tell a resignation apart from a client cancellation.
+    pub fn resign(env: Env, id: u64) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        c.freelancer.require_auth();
+        // `Disputed` is deliberately excluded: a dispute is already the
+        // freelancer's escalation path and must be settled by the admin.
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let refund = refund_client_and_close(&env, &mut c);
+        let key = DataKey::Resigned(id);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        save(&env, &c);
+        env.events().publish((symbol_short!("resign"), id), refund);
+        Ok(())
+    }
+
+    /// Whether the freelancer resigned from this escrow.
+    pub fn was_resigned(env: Env, id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Resigned(id))
+            .unwrap_or(false)
     }
 
     /// After completion the client may rate the freelancer (1..=5) once per contract.

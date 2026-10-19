@@ -31,11 +31,32 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `open_dispute(id, caller)` | client or freelancer | Freeze the escrow pending resolution |
 | `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance (basis points to freelancer) |
 | `cancel_contract(id)` | client | Refund unreleased funds and close |
+| `resign(id)` | freelancer | Withdraw from the job, refund the client in full and close |
 | `issue_reputation(id, rating)` | client | Rate a completed job (1-5), once |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
-| `get_contract(id)`, `contract_count()`, `get_reputation(addr)`, `get_admin()`, `version()` | - | Reads |
+| `get_contract(id)`, `contract_count()`, `get_reputation(addr)`, `get_admin()`, `was_resigned(id)`, `version()` | - | Reads |
 
 Status flow: `Created -> Funded -> Completed`, with `Disputed -> Resolved` and `Cancelled` side exits.
+
+### Freelancer resignation
+
+`cancel_contract` is the client's call and `open_dispute` drags the admin into a
+non-contentious outcome, so before this the only freelancer-side exit from a job
+they can no longer do was to stop responding and wait to be cancelled.
+`resign(id)` gives them a clean one:
+
+- Freelancer auth, escrow must be `Created | Funded`, and it respects the pause
+  gate. `Disputed` is deliberately excluded — a dispute is already the
+  freelancer's escalation path and must be settled by the admin.
+- Refunds `funded_amount - released_amount` to the client and sets `Cancelled`.
+  Milestones already released stay paid: there is no clawback.
+- Both `resign` and `cancel_contract` share one private helper, so the refund
+  destination (always the client) cannot drift between the two exits.
+- `DataKey::Resigned(id) -> bool` records which exit was used, because both end
+  in `Cancelled` and reputation logic needs to tell them apart. Read it with
+  `was_resigned(id)`.
+
+Event: `resign(id) -> refunded`. No new errors.
 
 ## Build and test
 
